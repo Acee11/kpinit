@@ -4,7 +4,7 @@ import sys
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from gen_launch import gen_launch
+from gen_launch import gen_launch, gen_launch_debug
 from gen_debug import gen_debug
 from gen_exploit_src import gen_exploit_src
 from extract_files import (
@@ -32,6 +32,7 @@ def gen_exploit():
     generate the workspace/exploit directory
     """
     gen_launch()
+    gen_launch_debug()
     extract_init()
     if ctx.ramfs.wspath is not None:
         extract_ko()

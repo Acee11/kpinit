@@ -65,6 +65,83 @@ unmount /
 quit
 _EOF_
 """
+DEBUG_PATCH_SCRIPT = """
+FS_DIR="{fs_dir}"
+COMPRESSED="{compressed}"
+INIT="$FS_DIR/init"
+
+cp ./exploit "$FS_DIR/exploit"
+
+# Patch init in-place: write /etc/shadow with a known root hash so `su` works.
+cp "$INIT" "$INIT.bak"
+HASH='$6$URuSfSlyxW2WbE$ME6t7E1Z1fxNSptQAt1UWntRbrr6oDM/MmLLT7ptgDJypVURnF/TDYYkmltQgEeUe3a1NTZBCP0GxwK/CKRaU1'
+awk -v hash="$HASH" '
+  {{ print }}
+  /^chmod 644 \\/etc\\/group$/ && !done_shadow {{
+    print ""
+    print "# DEBUG: enable `su root` (password: root)"
+    print "echo '\\''root:" hash ":0:0:99999:7:::'\\'' > /etc/shadow"
+    print "chmod 600 /etc/shadow"
+    done_shadow = 1
+  }}
+  /^chmod 700 -R \\/root$/ && !done_suid {{
+    print ""
+    print "# DEBUG: setuid busybox so `su` works (must be after chown -R)"
+    print "chmod u+s /bin/busybox"
+    done_suid = 1
+  }}
+' "$INIT.bak" > "$INIT"
+chmod 755 "$INIT"
+
+pushd "$FS_DIR" > /dev/null
+find . -print0 |
+  cpio --null -ov --format=newc -R root:root 2>/dev/null |
+  gzip -1 -q > "$COMPRESSED"
+popd > /dev/null
+
+# Restore original init so non-debug launch.sh is unaffected.
+mv "$INIT.bak" "$INIT"
+"""
+DEBUG_QCOW_SCRIPT = """
+export LIBGUESTFS_BACKEND=direct
+ORIG_QCOW="{orig_qcow}"
+DEBUG_QCOW="{debug_qcow}"
+HASH='$6$URuSfSlyxW2WbE$ME6t7E1Z1fxNSptQAt1UWntRbrr6oDM/MmLLT7ptgDJypVURnF/TDYYkmltQgEeUe3a1NTZBCP0GxwK/CKRaU1'
+EXPLOIT_HOST="$(pwd)/exploit"
+
+# Create a qcow2 overlay so the original image stays untouched.
+rm -f "$DEBUG_QCOW"
+qemu-img create -f qcow2 -F qcow2 -b "$ORIG_QCOW" "$DEBUG_QCOW" >/dev/null
+
+# Pull /etc/shadow to host, patch the root entry, push it back along with the
+# exploit binary. Done in two guestfish calls so the host-side sed can use
+# bash-expanded $HASH without fighting guestfish's `!` quoting.
+TMP_SHADOW=$(mktemp)
+guestfish --rw -a "$DEBUG_QCOW" -i <<_EOF_
+download /etc/shadow $TMP_SHADOW
+_EOF_
+
+if [ ! -s "$TMP_SHADOW" ]; then
+  echo "[!] failed to read /etc/shadow from $DEBUG_QCOW"
+  rm -f "$TMP_SHADOW"
+  exit 1
+fi
+
+sed -i "s|^root:[^:]*:|root:$HASH:|" "$TMP_SHADOW"
+
+guestfish --rw -a "$DEBUG_QCOW" -i <<_EOF_
+upload $TMP_SHADOW /etc/shadow
+copy-in $EXPLOIT_HOST /
+_EOF_
+
+rm -f "$TMP_SHADOW"
+"""
+DEBUG_CLEANUP = """
+rm -f "$COMPRESSED"
+"""
+DEBUG_QCOW_CLEANUP = """
+rm -f "$DEBUG_QCOW"
+"""
 GDB_CMD = """
 sed -i "s/^target remote localhost:.*/target remote localhost:$PORT/" {}
 if [ "$GDB" = "yes" ]; then
@@ -77,6 +154,11 @@ fi
 """
 
 parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+for _opt in ("append", "smp", "cpu", "hda", "hdb", "hdc", "hdd"):
+    parser.add_argument(f"-{_opt}")
+for _opt in ("drive",):
+    parser.add_argument(f"-{_opt}", action="append")
+parser.add_argument("-s", action="store_true")
 
 
 def get_qemu_cmd(file_bs):
@@ -131,13 +213,6 @@ def gen_qemu_cmd():
     f = open(ctx.run_sh.get(), "r")
     content = f.read()
     qemucmd = get_qemu_cmd(content)
-    opts = ["append", "smp", "cpu", "hda", "hdb", "hdc", "hdd"]
-    opts_append = ["drive"]
-    for opt in opts:
-        parser.add_argument(f"-{opt}")
-    for opt in opts_append:
-        parser.add_argument(f"-{opt}", action="append")
-    parser.add_argument("-s", action="store_true")
     parsed, _ = parser.parse_known_args(shlex.split(qemucmd))
     imgfile = check_qemu(parsed)
     if imgfile is not None and (fsimgs := ctx.fsimgs.get()) is not None:
@@ -195,6 +270,68 @@ def gen_launch():
     gdb += f" -ix {ctx.challdir('debug.gdb')}"
     script += GDB_CMD.format(ctx.challdir("debug.gdb"), gdb, gdb)
     script += qemucmd
+    f = open(launch_fpath, "w")
+    f.write(script)
+    os.chmod(launch_fpath, 0o700)
+
+
+def gen_launch_debug():
+    """
+    Generate launch_debug.sh: like launch.sh but patches the guest to make
+    `su root` work (password: root) and copies exploit to /exploit. Supports
+    cpio-based challenges (separate initramfs-debug.cpio.gz) and qcow-based
+    challenges (qcow2 overlay so the original image stays untouched).
+    """
+    use_cpio = ctx.ramfs.wspath is not None
+    launch_fpath = ctx.expdir("launch_debug.sh")
+    compiler = "aarch64-linux-gnu-gcc" if ctx.arch == "aarch64" else "gcc"
+    qemucmd = gen_qemu_cmd()
+    if qemucmd is None:
+        warn("Unexpected boot script format; skipping launch_debug.sh.")
+        return
+    qcow_path = None
+    if not use_cpio:
+        qcow_path = ctx.fsimg.get()
+        if qcow_path is None:
+            m = re.search(r"-hda\s+([^\s\\]+)", qemucmd)
+            if m:
+                qcow_path = m.group(1).strip('"').strip("'")
+    use_qcow = (not use_cpio) and qcow_path is not None
+    if not (use_cpio or use_qcow):
+        warn("No ramfs or qcow detected; skipping launch_debug.sh.")
+        return
+    script = HEADER
+    script += OPTIONS
+    script += COMPILE_EXPLOIT.format(compiler)
+    if use_cpio:
+        debug_cpio = ctx.challdir("initramfs-debug.cpio.gz")
+        qemucmd = qemucmd.replace(
+            f"-initrd {ctx.ramfs.wspath}",
+            f'-initrd "{debug_cpio}"',
+        )
+        script += DEBUG_PATCH_SCRIPT.format(
+            fs_dir=ctx.challdir(ctx.fsname()),
+            compressed=debug_cpio,
+        )
+        cleanup = DEBUG_CLEANUP
+    else:
+        orig_qcow = qcow_path
+        debug_qcow = ctx.challdir("debug.qcow2")
+        qemucmd = re.sub(
+            r"-hda\s+\S+",
+            f'-hda "{debug_qcow}"',
+            qemucmd,
+        )
+        script += DEBUG_QCOW_SCRIPT.format(
+            orig_qcow=orig_qcow,
+            debug_qcow=debug_qcow,
+        )
+        cleanup = DEBUG_QCOW_CLEANUP
+    gdb = "gdb" if "x86" in ctx.arch else "gdb-multiarch"
+    gdb += f" -ix {ctx.challdir('debug.gdb')}"
+    script += GDB_CMD.format(ctx.challdir("debug.gdb"), gdb, gdb)
+    script += qemucmd
+    script += cleanup
     f = open(launch_fpath, "w")
     f.write(script)
     os.chmod(launch_fpath, 0o700)
