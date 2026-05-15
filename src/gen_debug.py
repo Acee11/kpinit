@@ -1,6 +1,8 @@
 from utils import error, ctx, runcmd
 
 kbase_template = """
+set context-sections none
+
 python
 import gdb
 kbase = 0
