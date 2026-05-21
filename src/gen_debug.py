@@ -3,6 +3,27 @@ from utils import error, ctx, runcmd
 kbase_template = """
 set context-sections none
 
+define vmemmmap_info
+  if $argc != 1
+    printf "usage: pfn <page-ptr>\n"
+  else
+    set $p   = (unsigned long)$arg0
+    set $vmm = (unsigned long)vmemmap_base
+    set $po  = (unsigned long)page_offset_base
+    set $_pfn   = ($p - $vmm) >> 6
+    set $_phys  = $_pfn << 12
+    set $_kvirt = $_phys + $po
+    printf "page  = 0x%lx\n",    $p
+    printf "pfn   = 0x%lx (%lu)\n", $_pfn, $_pfn
+    printf "phys  = 0x%lx\n",    $_phys
+    printf "kvirt = 0x%lx\n",    $_kvirt
+  end
+end
+document pfn
+Print PFN / physical addr / direct-map VA for a struct page *.
+Usage: pfn <page-ptr>
+end
+
 python
 import gdb
 kbase = 0
