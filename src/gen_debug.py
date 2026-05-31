@@ -19,9 +19,9 @@ define vmemmmap_info
     printf "kvirt = 0x%lx\n",    $_kvirt
   end
 end
-document pfn
+document vmemmmap_info
 Print PFN / physical addr / direct-map VA for a struct page *.
-Usage: pfn <page-ptr>
+Usage: vmemmmap_info <page-ptr>
 end
 
 python
